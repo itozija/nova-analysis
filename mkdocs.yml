@@ -15,7 +15,9 @@ theme:
 
 nav:
   - Home: index.md
-  - Setup Guide: setup/index.md
+  - Setup Guide:
+    - Installation: setup/index.md
+    - Adding Files: setup/adding-files.md
   - Agents:
     - Nova (YouTube): agents/nova.md
     - Second Brain T: agents/second-brain.md
