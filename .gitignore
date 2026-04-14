@@ -1,0 +1,5 @@
+site/
+.obsidian/
+*.log
+secrets.toml
+config.toml

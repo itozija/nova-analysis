@@ -1,0 +1,1738 @@
+#!/usr/bin/env python3
+"""
+Second Brain T v1.0
+Transform any folder into a structured knowledge base.
+
+What it does:
+  - Scans any folder (code, docs, papers)
+  - Auto-converts PDFs to markdown
+  - AST parsing for Python + TypeScript/JavaScript
+  - SHA256 caching (skip unchanged files)
+  - Tiered context packs: Tier 0 (index), Tier 1 (topic), Tier 2 (entity)
+  - Wiki with wikilinks and graph coloring (Obsidian compatible)
+  - Interactive knowledge graph (vis.js) with community clustering
+  - Edge confidence tagging: EXTRACTED / INFERRED / AMBIGUOUS
+  - Unified dashboard linking everything
+  - Auto-installs Claude skill + /sbt command
+
+Usage:
+  python3 build.py <folder>
+  python3 build.py <folder> --title "My KB"
+  python3 build.py <folder> --no-cache
+
+  PDFs are auto-converted automatically — no flag needed.
+"""
+
+import os, re, sys, json, hashlib, shutil
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict, Counter
+from typing import Dict, List, Tuple, Optional
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+SUPPORTED_EXTS = {
+    '.md', '.txt', '.rst',
+    '.py', '.ts', '.tsx', '.js', '.jsx',
+    '.json', '.yaml', '.yml', '.toml', '.sql', '.sh', '.css',
+}
+CODE_EXTS = {'.py', '.ts', '.tsx', '.js', '.jsx'}
+SKIP_DIRS = {
+    'node_modules', '.git', '.next', '__pycache__', 'dist', 'build',
+    '.venv', 'venv', 'cache', '.obsidian', 'sbt-out', 'output',
+    '.github', '.sbt-cache', 'tests',
+}
+SKIP_FILES = {'package-lock.json', 'yarn.lock', 'poetry.lock'}
+MAX_FILE_CHARS = 10000
+CACHE_DIR_NAME = '.sbt-cache'
+
+TOPIC_COLORS = {
+    # Research topics
+    'megaprojects':       '#4A90D9',
+    'culture':            '#E74C3C',
+    'institutions':       '#9B59B6',
+    'technology':         '#1ABC9C',
+    'time-temporality':   '#F5A623',
+    'methods':            '#2ECC71',
+    'development':        '#E67E22',
+    'social-impact':      '#F39C12',
+    'politics':           '#27AE60',
+    'knowledge':          '#8E44AD',
+    # Code topics (for software projects)
+    'api':                '#E74C3C',
+    'auth':               '#9B59B6',
+    'config':             '#95A5A6',
+    'database':           '#1ABC9C',
+    'decision-making':    '#F5A623',
+    'docs':               '#2ECC71',
+    'extraction':         '#E67E22',
+    'frontend':           '#3498DB',
+    'graph':              '#F39C12',
+    'installation':       '#27AE60',
+    'testing':            '#E67E22',
+    'wiki':               '#8E44AD',
+    'general':            '#BDC3C7',
+}
+
+STOPWORDS = {
+    'the','a','an','and','or','but','in','on','at','to','for','of','with',
+    'by','from','is','are','was','were','be','been','being','have','has',
+    'had','do','does','did','will','would','could','should','may','might',
+    'this','that','these','those','it','its','they','them','their','we',
+    'our','you','your','i','my','he','she','as','if','so','not','no',
+    'than','then','when','where','which','who','what','how','all','any',
+    'each','can','also','more','such','into','about','up','out','one',
+    'use','used','using','new','over','page','time','project','return',
+    'import','class','def','function','const','let','var','type',
+    'interface','export','default','async','await','true','false',
+    'none','null','undefined','self','args','kwargs',
+}
+
+TOPIC_RULES = [
+    # ── Research topics (checked first) ───────────────────────────────────────
+    (['megaproject', 'infrastructure', 'cost overrun', 'flyvbjerg', 'iron law',
+      'cost underestimation', 'transportation project', 'major project',
+      'project delivery', 'planning fallacy'], 'megaprojects'),
+    (['culture', 'cultural', 'hofstede', 'swidler', 'markus', 'kitayama',
+      'values', 'norms', 'identity', 'cognition', 'self-construal',
+      'individualism', 'collectivism', 'symbolic'], 'culture'),
+    (['institution', 'institutional', 'legitimacy', 'logics', 'field',
+      'organizational', 'governance', 'state fragility', 'entrepreneurship',
+      'informal economy', 'poverty', 'microfinance', 'isomorphism'], 'institutions'),
+    (['technology', 'technological', 'artifact', 'sociotechnical', 'routine',
+      'agency', 'materiality', 'infrastructure', 'standard', 'classification',
+      'winner', 'leonardi', 'barley', 'latour', 'actor-network'], 'technology'),
+    (['temporal', 'time', 'temporality', 'clock', 'schedule', 'deadline',
+      'future', 'prophecy', 'punctuated', 'process', 'duration',
+      'reinecke', 'thompson', 'guyer'], 'time-temporality'),
+    (['method', 'methodology', 'research design', 'qualitative', 'quantitative',
+      'randomized', 'evidence', 'ethnography', 'case study', 'survey',
+      'rigorous', 'evaluation', 'impact evaluation', 'rct'], 'methods'),
+    (['development', 'developing', 'global south', 'aid', 'cameroon', 'africa',
+      'kenya', 'ukraine', 'conflict', 'fragile', 'participation',
+      'community', 'poverty reduction', 'world bank'], 'development'),
+    (['social impact', 'impact accounting', 'beneficiar', 'evaluator',
+      'social value', 'creating value', 'measurement', 'accounting',
+      'materiality', 'empowerment', 'harambee'], 'social-impact'),
+    (['political', 'politics', 'power', 'state', 'public', 'policy',
+      'government', 'regulation', 'authority', 'sovereignty',
+      'financing', 'revolution', 'reform'], 'politics'),
+    (['knowledge', 'epistemolog', 'science', 'facts', 'truth',
+      'classification', 'ontolog', 'paradigm', 'discourse',
+      'narrative', 'story', 'framing', 'post-truth'], 'knowledge'),
+    # ── Code topics (for software projects) ───────────────────────────────────
+    (['install', 'setup', 'getting-started', 'requirements', 'install.sh'], 'installation'),
+    (['api', 'route', 'endpoint', 'server', 'rest'], 'api'),
+    (['auth', 'login', 'signup', 'middleware', 'session', 'oauth', 'token'], 'auth'),
+    (['schema', 'database', 'db', 'sql', 'supabase', 'migration', 'model'], 'database'),
+    (['component', 'ui', 'navbar', 'layout', 'page', 'frontend', 'css', 'style'], 'frontend'),
+    (['config', 'tsconfig', 'package', 'next.config', 'eslint', 'pyproject', 'cargo'], 'config'),
+    (['test', 'spec', 'e2e', 'fixture', 'mock'], 'testing'),
+    (['extract', 'parse', 'ast', 'tree-sitter', 'ingest', 'detect', 'analyze'], 'extraction'),
+    (['graph', 'cluster', 'node', 'edge', 'network', 'leiden', 'louvain', 'vis'], 'graph'),
+    (['wiki', 'obsidian', 'wikilink', 'vault', 'tier', 'compiled'], 'wiki'),
+    (['readme', 'changelog', 'contributing', 'license', 'architecture', 'security'], 'docs'),
+    (['bias', 'heuristic', 'decision', 'cognitive', 'behavior', 'behavioral'], 'decision-making'),
+]
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def parse_args():
+    args = sys.argv[1:]
+    target = None
+    title = 'Knowledge Base'
+    use_cache = True
+    clear_output = None  # None = ask, True = clear, False = update
+    i = 0
+    while i < len(args):
+        if args[i] == '--title' and i + 1 < len(args):
+            title = args[i + 1]; i += 2
+        elif args[i] == '--no-cache':
+            use_cache = False; i += 1
+        elif args[i] == '--clear':
+            clear_output = True; i += 1
+        elif args[i] == '--update':
+            clear_output = False; i += 1
+        elif not args[i].startswith('--'):
+            target = Path(args[i]).resolve(); i += 1
+        else:
+            i += 1
+    return target, title, use_cache, clear_output
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def slugify(text: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+def file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(str(path.resolve()).encode())
+    try:
+        h.update(path.read_bytes())
+    except Exception:
+        pass
+    return h.hexdigest()
+
+def strip_frontmatter(text: str) -> str:
+    if text.startswith('---'):
+        end = text.find('---', 3)
+        if end != -1:
+            return text[end + 3:].strip()
+    return text
+
+def read_file(path: Path, max_chars: int = MAX_FILE_CHARS) -> str:
+    try:
+        return path.read_text(encoding='utf-8', errors='ignore')[:max_chars]
+    except Exception:
+        return ''
+
+def load_gitignore(folder: Path) -> List[str]:
+    gi = folder / '.gitignore'
+    if not gi.exists():
+        return []
+    return [
+        line.strip().rstrip('/')
+        for line in gi.read_text(errors='ignore').splitlines()
+        if line.strip() and not line.startswith('#')
+    ]
+
+def is_gitignored(path: Path, root: Path, patterns: List[str]) -> bool:
+    try:
+        rel = str(path.relative_to(root))
+    except ValueError:
+        return False
+    return any(p in rel or rel.endswith(p) for p in patterns)
+
+
+# ── File scanning ─────────────────────────────────────────────────────────────
+
+def collect_files(folder: Path) -> List[Path]:
+    gitignore = load_gitignore(folder)
+    files = []
+    for root, dirs, filenames in os.walk(folder):
+        root_path = Path(root)
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIRS
+            and not d.startswith('.')
+            and not is_gitignored(root_path / d, folder, gitignore)
+        ]
+        for fname in filenames:
+            if fname in SKIP_FILES:
+                continue
+            p = root_path / fname
+            if p.suffix.lower() in SUPPORTED_EXTS and not is_gitignored(p, folder, gitignore):
+                files.append(p)
+    return sorted(files)
+
+def collect_pdfs(folder: Path) -> List[Path]:
+    pdfs = []
+    for root, dirs, filenames in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in filenames:
+            if fname.lower().endswith('.pdf'):
+                pdfs.append(Path(root) / fname)
+    return pdfs
+
+
+# ── PDF conversion ────────────────────────────────────────────────────────────
+
+def convert_pdfs(folder: Path) -> int:
+    # Try PyMuPDF first (better quality), fall back to pdfplumber
+    try:
+        import fitz  # PyMuPDF
+        return _convert_pdfs_fitz(folder, fitz)
+    except ImportError:
+        pass
+    try:
+        import pdfplumber
+        return _convert_pdfs_plumber(folder, pdfplumber)
+    except ImportError:
+        print('  No PDF library found — install PyMuPDF: pip3 install PyMuPDF')
+        return 0
+
+def _convert_pdfs_fitz(folder: Path, fitz) -> int:
+    converted = 0
+    for pdf_path in collect_pdfs(folder):
+        md_path = pdf_path.with_suffix('.md')
+        if md_path.exists():
+            continue
+        try:
+            doc = fitz.open(str(pdf_path))
+            # Extract real metadata from PDF
+            meta = doc.metadata or {}
+            real_title = (meta.get('title') or '').strip()
+            real_author = (meta.get('author') or '').strip()
+            pages = []
+            for i, page in enumerate(doc):
+                text = page.get_text('text')
+                if text and text.strip():
+                    # Fix common PDF garbling: words run together
+                    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+                    pages.append(f'<!-- Page {i+1} -->\n{text.strip()}')
+            doc.close()
+            if pages:
+                fm_title = real_title if real_title and len(real_title) > 3 else pdf_path.stem
+                fm_author = real_author if real_author else ''
+                frontmatter = f'---\ntitle: "{fm_title}"\nauthor: "{fm_author}"\nsource: "{pdf_path.name}"\n---\n\n'
+                heading = f'# {fm_title}\n\n'
+                content = frontmatter + heading + '\n\n---\n\n'.join(pages)
+                md_path.write_text(content, encoding='utf-8')
+                converted += 1
+                print(f'  PDF → {md_path.name}')
+        except Exception as e:
+            print(f'  PDF error {pdf_path.name}: {e}')
+    return converted
+
+def _convert_pdfs_plumber(folder: Path, pdfplumber) -> int:
+    converted = 0
+    for pdf_path in collect_pdfs(folder):
+        md_path = pdf_path.with_suffix('.md')
+        if md_path.exists():
+            continue
+        try:
+            pages = []
+            with pdfplumber.open(pdf_path) as pdf:
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text()
+                    if text and text.strip():
+                        pages.append(f'<!-- Page {i+1} -->\n{text.strip()}')
+            if pages:
+                content = (f'---\ntitle: "{pdf_path.stem}"\nauthor: ""\nsource: "{pdf_path.name}"\n---\n\n'
+                           f'# {pdf_path.stem}\n\n' + '\n\n---\n\n'.join(pages))
+                md_path.write_text(content, encoding='utf-8')
+                converted += 1
+                print(f'  PDF → {md_path.name}')
+        except Exception as e:
+            print(f'  PDF error {pdf_path.name}: {e}')
+    return converted
+
+
+# ── Word conversion ───────────────────────────────────────────────────────────
+
+def collect_docx(folder: Path) -> List[Path]:
+    files = []
+    for root, dirs, filenames in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in filenames:
+            if fname.lower().endswith('.docx') and not fname.startswith('~$'):
+                files.append(Path(root) / fname)
+    return files
+
+def convert_docx(folder: Path) -> int:
+    try:
+        from docx import Document
+    except ImportError:
+        print('  python-docx not installed — skipping Word docs (pip3 install python-docx)')
+        return 0
+    converted = 0
+    for docx_path in collect_docx(folder):
+        md_path = docx_path.with_suffix('.md')
+        if md_path.exists():
+            continue
+        try:
+            doc = Document(str(docx_path))
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            if paragraphs:
+                content = (f'---\ntitle: "{docx_path.stem}"\nsource: "{docx_path.name}"\n---\n\n'
+                           f'# {docx_path.stem}\n\n' + '\n\n'.join(paragraphs))
+                md_path.write_text(content, encoding='utf-8')
+                converted += 1
+                print(f'  DOCX → {md_path.name}')
+        except Exception as e:
+            print(f'  DOCX error {docx_path.name}: {e}')
+    return converted
+
+
+# ── PowerPoint conversion ─────────────────────────────────────────────────────
+
+def collect_pptx(folder: Path) -> List[Path]:
+    files = []
+    for root, dirs, filenames in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in filenames:
+            if fname.lower().endswith('.pptx') and not fname.startswith('~$'):
+                files.append(Path(root) / fname)
+    return files
+
+def convert_pptx(folder: Path) -> int:
+    try:
+        from pptx import Presentation
+    except ImportError:
+        print('  python-pptx not installed — skipping PowerPoint files (pip3 install python-pptx)')
+        return 0
+    converted = 0
+    for pptx_path in collect_pptx(folder):
+        md_path = pptx_path.with_suffix('.md')
+        if md_path.exists():
+            continue
+        try:
+            prs = Presentation(str(pptx_path))
+            slides = []
+            for i, slide in enumerate(prs.slides, 1):
+                texts = []
+                for shape in slide.shapes:
+                    if hasattr(shape, 'text') and shape.text.strip():
+                        texts.append(shape.text.strip())
+                if texts:
+                    slides.append(f'<!-- Slide {i} -->\n' + '\n'.join(texts))
+            if slides:
+                content = (f'---\ntitle: "{pptx_path.stem}"\nsource: "{pptx_path.name}"\n---\n\n'
+                           f'# {pptx_path.stem}\n\n' + '\n\n---\n\n'.join(slides))
+                md_path.write_text(content, encoding='utf-8')
+                converted += 1
+                print(f'  PPTX → {md_path.name}')
+        except Exception as e:
+            print(f'  PPTX error {pptx_path.name}: {e}')
+    return converted
+
+
+# ── SHA256 Cache ──────────────────────────────────────────────────────────────
+
+class Cache:
+    def __init__(self, root: Path, enabled: bool = True):
+        self.dir = root / CACHE_DIR_NAME
+        self.enabled = enabled
+        if enabled:
+            self.dir.mkdir(exist_ok=True)
+
+    def load(self, path: Path) -> Optional[dict]:
+        if not self.enabled:
+            return None
+        cache_file = self.dir / f'{file_hash(path)}.json'
+        if cache_file.exists():
+            try:
+                return json.loads(cache_file.read_text())
+            except Exception:
+                return None
+        return None
+
+    def save(self, path: Path, data: dict):
+        if not self.enabled:
+            return
+        cache_file = self.dir / f'{file_hash(path)}.json'
+        tmp = cache_file.with_suffix('.tmp')
+        tmp.write_text(json.dumps(data), encoding='utf-8')
+        tmp.rename(cache_file)
+
+
+# ── AST extraction ────────────────────────────────────────────────────────────
+
+def extract_python_ast(path: Path) -> Tuple[List[str], List[Tuple[str, str]]]:
+    try:
+        import ast
+        tree = ast.parse(path.read_text(encoding='utf-8', errors='ignore'))
+    except Exception:
+        return [], []
+    nodes, edges = [], []
+    label = path.stem
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            nodes.append(f'class:{node.name}')
+            edges.append((label, f'class:{node.name}'))
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    edges.append((f'class:{node.name}', f'class:{base.id}'))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nodes.append(f'fn:{node.name}')
+            edges.append((label, f'fn:{node.name}'))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                edges.append((label, f'import:{alias.name.split(".")[0]}'))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                edges.append((label, f'import:{node.module.split(".")[0]}'))
+    return nodes, edges
+
+def extract_ts_structure(text: str, label: str) -> List[Tuple[str, str]]:
+    edges = []
+    for m in re.finditer(r"import\s+.*?from\s+['\"]([^'\"]+)['\"]", text):
+        mod = m.group(1)
+        dep = mod.split('/')[-1].replace('.ts','').replace('.tsx','').replace('.js','')
+        edges.append((label, f'{"file" if mod.startswith(".") else "pkg"}:{dep}'))
+    for m in re.finditer(r'export\s+(?:default\s+)?(?:async\s+)?(?:function|class)\s+(\w+)', text):
+        edges.append((label, f'export:{m.group(1)}'))
+    return edges
+
+def extract_code_structure(path: Path):
+    if path.suffix == '.py':
+        return extract_python_ast(path)
+    elif path.suffix in {'.ts', '.tsx', '.js', '.jsx'}:
+        return [], extract_ts_structure(read_file(path), path.stem)
+    return [], []
+
+
+# ── Topic + keyword extraction ────────────────────────────────────────────────
+
+def infer_topic(path: Path, text: str) -> str:
+    combined = ' '.join(p.lower() for p in path.parts) + ' ' + text[:2000].lower()
+    for keywords, topic in TOPIC_RULES:
+        if any(k in combined for k in keywords):
+            return topic
+    return 'general'
+
+def extract_title(path: Path, text: str) -> str:
+    """Try to extract a real human-readable title from document content."""
+    SKIP_PATTERNS = re.compile(
+        r'(journal|homepage|www\.|http|vol\.|contents|elsevier|springer|wiley|jstor'
+        r'|tandfonline|sagepub|sciencedirect|\.com|\.org|copyright|©|issn'
+        r'|article info|abstract|keywords|download|available online'
+        r'|cite this article|digital archive|subscriber|bluebook'
+        r'|pages \d|number \d|volume \d|beech tree|guild|publishing'
+        r'|we use information technology|productivity and facilitates'
+        r'|user name|this digital copy|extract and the work'
+        r'|long, norman|to cite this|aligning incentives)',
+        re.IGNORECASE
+    )
+
+    # For converted documents: scan body text for a real title
+    # Strategy: find lines that look like paper/chapter titles
+    body = strip_frontmatter(text)
+    lines = body.splitlines()
+    candidates = []
+    for line in lines[:80]:
+        line = line.strip()
+        # Skip page markers, short lines, headings that are just filenames
+        if not line or line.startswith('<!--') or line.startswith('#'):
+            continue
+        if SKIP_PATTERNS.search(line):
+            continue
+        # Skip lines that look like author names (contain initials like "A.B.") or affiliations
+        if re.search(r'\b[A-Z]\.\s*[A-Z]\.|\bUniversity\b|\bDepartment\b|\bSchool\b', line):
+            continue
+        # Skip lines that are mostly numbers/codes
+        if re.match(r'^[\d\s\(\)\-\.,]+$', line):
+            continue
+        # Good candidate: 20-200 chars, mixed case, reads like a title
+        if 20 <= len(line) <= 200 and re.search(r'[a-z]', line) and re.search(r'[A-Za-z]{3}', line):
+            candidates.append(line)
+        if len(candidates) >= 3:
+            break
+
+    if candidates:
+        # Pick the best candidate — prefer longer, more title-like lines
+        best = max(candidates, key=lambda l: (
+            len(re.findall(r'[a-z]', l)),   # more lowercase = more likely a sentence
+            len(l.split()),                  # more words = more likely a full title
+        ))
+        # Clean trailing junk (like "T" at end from PDF extraction artifacts)
+        best = re.sub(r'\s+[A-Z]$', '', best).strip()
+        if len(best) > 10:
+            return best[:120]
+
+    # Look for first real markdown heading (not a filename)
+    for line in lines[:40]:
+        line = line.strip()
+        if line.startswith('# '):
+            title = line.lstrip('#').strip()
+            if (not re.match(r'^[\w\-\.]+$', title) and len(title) > 10
+                    and not SKIP_PATTERNS.search(title)):
+                return title[:120]
+
+    # Fall back to cleaned filename
+    stem = path.stem
+    stem = re.sub(r'^[\d\-]+s\d+[\.\-][A-Z0-9]+.*', '', stem).strip('-_ ')
+    if not stem or len(stem) < 4:
+        stem = path.stem
+    return stem.replace('-', ' ').replace('_', ' ').title()
+
+def extract_summary(text: str) -> str:
+    """Extract a 2-3 sentence summary from the abstract or opening of a document."""
+    # Try to find abstract section
+    abstract_match = re.search(
+        r'(?:abstract|summary|overview)[:\s\n]+(.+?)(?:\n\n|\n(?:keywords|introduction|1\.|background))',
+        text[:3000], re.IGNORECASE | re.DOTALL
+    )
+    if abstract_match:
+        raw = abstract_match.group(1).strip()
+        # Clean up PDF extraction artifacts (no spaces between words)
+        raw = re.sub(r'\s+', ' ', raw)
+        sentences = re.split(r'(?<=[.!?])\s+', raw)
+        good = [s.strip() for s in sentences if len(s.strip()) > 40 and re.search(r'[a-z]', s)]
+        if good:
+            return ' '.join(good[:3])
+
+    # Fall back: take first 3 meaningful sentences from body
+    body = re.sub(r'<!--.*?-->', '', text[:3000], flags=re.DOTALL)
+    body = re.sub(r'\s+', ' ', body).strip()
+    sentences = re.split(r'(?<=[.!?])\s+', body)
+    good = [s.strip() for s in sentences
+            if len(s.strip()) > 60
+            and re.search(r'[a-z]', s)
+            and not re.search(r'(journal|homepage|www\.|copyright|issn|doi:|page \d)', s, re.I)]
+    return ' '.join(good[:3]) if good else ''
+
+
+def extract_citation(path: Path, text: str) -> dict:
+    """Extract citation metadata: author, year, title."""
+    citation = {'title': '', 'authors': '', 'year': '', 'source': path.name}
+
+    # First try frontmatter (set by PyMuPDF converter)
+    fm_author = re.search(r'^author:\s*["\']?(.+?)["\']?\s*$', text[:400], re.MULTILINE)
+    fm_title  = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text[:400], re.MULTILINE)
+    if fm_author:
+        a = fm_author.group(1).strip()
+        if a and a != path.stem and len(a) > 2:
+            citation['authors'] = a
+    if fm_title:
+        t = fm_title.group(1).strip()
+        if t and t != path.stem and len(t) > 3:
+            citation['title'] = t
+
+    # Year — look for 4-digit year between 1950-2030
+    year_match = re.search(r'\b(19[5-9]\d|20[0-2]\d)\b', text[:1000])
+    if year_match:
+        citation['year'] = year_match.group(1)
+
+    # Fallback authors from body — "LastName et al." or "LastName, F."
+    if not citation['authors']:
+        author_match = re.search(
+            r'([A-Z][a-z]{2,}(?:,\s+[A-Z]\.?)+(?:\s+and\s+[A-Z][a-z]+(?:,\s+[A-Z]\.?)*)*'
+            r'|[A-Z][a-z]{2,}\s+et\s+al\.)',
+            text[text.find('-->'): text.find('-->')+800] if '-->' in text else text[:800]
+        )
+        if author_match:
+            citation['authors'] = author_match.group(0).strip()
+
+    # Title fallback
+    if not citation['title']:
+        citation['title'] = extract_title(path, text)
+
+    return citation
+
+
+def extract_keywords(text: str, top_n: int = 15) -> List[str]:
+    words = re.sub(r'[^a-zA-Z\s]', ' ', text.lower()).split()
+    freq = Counter(w for w in words if len(w) > 4 and w not in STOPWORDS)
+    return [w for w, _ in freq.most_common(top_n)]
+
+
+# ── Entity building ───────────────────────────────────────────────────────────
+
+def build_entities(files: List[Path], target: Path, cache: Cache) -> List[dict]:
+    entities = []
+    for f in files:
+        cached = cache.load(f)
+        if cached:
+            entities.append(cached)
+            continue
+        text = read_file(f)
+        if not text.strip():
+            continue
+        clean = strip_frontmatter(text)
+        ast_nodes, ast_edges = [], []
+        if f.suffix in CODE_EXTS:
+            ast_nodes, ast_edges = extract_code_structure(f)
+        word_count = len(clean.split())
+        citation = extract_citation(f, clean)
+        # Build display label: "Author (Year) — Title"
+        auth_short = citation['authors'].split(',')[0].strip() if citation['authors'] else ''
+        year = citation['year']
+        raw_title = extract_title(f, text)
+        if auth_short and year:
+            display_label = f'{auth_short} ({year}) — {raw_title}'
+        elif year:
+            display_label = f'({year}) — {raw_title}'
+        else:
+            display_label = raw_title
+        entity = {
+            'id': slugify(f.stem),
+            'label': display_label,
+            'title': raw_title,
+            'file': str(f.relative_to(target)),
+            'ext': f.suffix,
+            'text': clean,
+            'keywords': extract_keywords(clean),
+            'topic': infer_topic(f, clean),
+            'summary': extract_summary(clean),
+            'citation': citation,
+            'word_count': word_count,
+            'read_minutes': max(1, round(word_count / 200)),
+            'ast_nodes': ast_nodes,
+            'ast_edges': [[a, b] for a, b in ast_edges],
+            'is_code': f.suffix in CODE_EXTS,
+        }
+        cache.save(f, entity)
+        entities.append(entity)
+    # deduplicate IDs
+    seen: Dict[str, int] = {}
+    for e in entities:
+        orig = e['id']
+        n = seen.get(orig, 0)
+        if n > 0:
+            e['id'] = f'{orig}-{n}'
+        seen[orig] = n + 1
+    return entities
+
+
+# ── Relationship detection ────────────────────────────────────────────────────
+
+def find_relationships(entities: List[dict]) -> List[dict]:
+    id_map = {e['id']: e for e in entities}
+    edges = []
+    seen_pairs = set()
+
+    # AST edges — EXTRACTED
+    for e in entities:
+        for src, tgt in e.get('ast_edges', []):
+            tgt_slug = slugify(tgt.split(':')[-1])
+            if tgt_slug in id_map and tgt_slug != e['id']:
+                pair = tuple(sorted([e['id'], tgt_slug]))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    edges.append({
+                        'from': e['id'], 'to': tgt_slug,
+                        'weight': 10, 'type': 'EXTRACTED',
+                        'shared_keywords': [], 'relation': 'imports',
+                    })
+
+    # Semantic edges
+    elist = list(entities)
+    for i, a in enumerate(elist):
+        for j, b in enumerate(elist):
+            if j <= i:
+                continue
+            pair = tuple(sorted([a['id'], b['id']]))
+            shared = list(set(a['keywords']) & set(b['keywords']))
+            same_topic = a['topic'] == b['topic']
+            a_txt = a['text'][:3000].lower()
+            b_txt = b['text'][:3000].lower()
+            a_mentions_b = len(b['label']) > 3 and b['label'].lower().split()[0] in a_txt
+            b_mentions_a = len(a['label']) > 3 and a['label'].lower().split()[0] in b_txt
+            weight = (
+                len(shared) * 2 +
+                (3 if same_topic else 0) +
+                (5 if a_mentions_b else 0) +
+                (5 if b_mentions_a else 0)
+            )
+            if weight >= 4:
+                edge_type = ('EXTRACTED' if pair in seen_pairs
+                             else 'INFERRED' if weight >= 8
+                             else 'AMBIGUOUS')
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    edges.append({
+                        'from': a['id'], 'to': b['id'],
+                        'weight': weight, 'type': edge_type,
+                        'shared_keywords': shared[:5],
+                        'relation': 'same-topic' if same_topic else 'keyword-overlap',
+                    })
+    return edges
+
+
+# ── Community detection (label propagation, no external deps) ─────────────────
+
+def detect_communities(entities: List[dict], edges: List[dict]) -> Dict[str, int]:
+    import random, math
+    ids = [e['id'] for e in entities]
+    topic_map = {e['id']: e['topic'] for e in entities}
+    N = len(entities)
+
+    # TF-IDF weighting: rare shared keywords count more than common ones
+    # Build document frequency for each keyword
+    kw_doc_freq: Counter = Counter()
+    kw_map = {e['id']: set(e['keywords']) for e in entities}
+    for kws in kw_map.values():
+        for kw in kws:
+            kw_doc_freq[kw] += 1
+
+    def tfidf_overlap(id_a: str, id_b: str) -> float:
+        shared = kw_map.get(id_a, set()) & kw_map.get(id_b, set())
+        if not shared:
+            return 0.0
+        return sum(math.log(N / (kw_doc_freq[kw] + 1)) for kw in shared)
+
+    # Build adjacency with TF-IDF + topic boost
+    adj: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for edge in edges:
+        src, tgt, w = edge['from'], edge['to'], edge['weight']
+        tfidf = tfidf_overlap(src, tgt)
+        boost = 2.0 if topic_map.get(src) == topic_map.get(tgt) else 1.0
+        score = (w + tfidf) * boost
+        adj[src][tgt] = score
+        adj[tgt][src] = score
+
+    # Seed by topic so each topic starts as its own community
+    topic_seeds: Dict[str, int] = {}
+    seed_counter = 0
+    labels = {}
+    for e in entities:
+        t = e['topic']
+        if t not in topic_seeds:
+            topic_seeds[t] = seed_counter
+            seed_counter += 1
+        labels[e['id']] = topic_seeds[t]
+
+    # Label propagation with weighted voting
+    for _ in range(100):
+        changed = False
+        order = ids[:]
+        random.shuffle(order)
+        for node in order:
+            nbrs = adj[node]
+            if not nbrs:
+                continue
+            vote: Dict[int, float] = defaultdict(float)
+            for nb, w in nbrs.items():
+                vote[labels[nb]] += w
+            best = max(vote, key=vote.__getitem__)
+            if labels[node] != best:
+                labels[node] = best
+                changed = True
+        if not changed:
+            break
+
+    counts = Counter(labels.values())
+    rank = {label: i for i, (label, _) in enumerate(counts.most_common())}
+    return {node: rank[label] for node, label in labels.items()}
+
+
+# ── Tier generation ──────────────────────────────────────────────────────────────
+
+def build_tiers(entities: List[dict], edges: List[dict], out_dir: Path, title: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    topics: Dict[str, list] = defaultdict(list)
+    for e in entities:
+        topics[e['topic']].append(e)
+
+    # Tier 0 — global index
+    lines = [
+        f'# {title} — Tier 0: Index\n',
+        f'_Compiled: {datetime.now().strftime("%Y-%m-%d %H:%M")} | Entities: {len(entities)} | Connections: {len(edges)}_\n\n',
+        '## All Entities\n',
+    ]
+    for e in entities:
+        lines.append(f'- **{e["label"]}** ({e["topic"]}) — {", ".join(e["keywords"][:3])}')
+    lines.append('\n## Topics\n')
+    for topic, ents in sorted(topics.items()):
+        lines.append(f'- **{topic}** ({len(ents)} entities)')
+    (out_dir / 'index.md').write_text('\n'.join(lines), encoding='utf-8')
+
+    # Tier 1 — by topic
+    t1 = out_dir / 'topic'
+    t1.mkdir(exist_ok=True)
+    for topic, ents in topics.items():
+        lines = [f'# {topic.replace("-"," ").title()} — Tier 1: Topic Context\n', f'_Entities: {len(ents)}_\n']
+        for e in ents:
+            content = e['text'].strip()[:2000]
+            if len(e['text'].strip()) > 2000:
+                content += '\n\n_[truncated — see Tier 2]_'
+            lines += [f'\n## {e["label"]} (`{e["file"]}`)\n',
+                      f'_Keywords: {", ".join(e["keywords"][:5])}_\n', content]
+        (t1 / f'{slugify(topic)}.md').write_text('\n'.join(lines), encoding='utf-8')
+
+    # Tier 2 — per entity
+    t2 = out_dir / 'entity'
+    t2.mkdir(exist_ok=True)
+    edge_map: Dict[str, list] = defaultdict(list)
+    for edge in edges:
+        edge_map[edge['from']].append(edge)
+        edge_map[edge['to']].append(edge)
+    id_map = {e['id']: e for e in entities}
+    for e in entities:
+        related_edges = sorted(edge_map[e['id']], key=lambda x: -x['weight'])[:8]
+        related = [(id_map[ed['to'] if ed['from'] == e['id'] else ed['from']], ed)
+                   for ed in related_edges if (ed['to'] if ed['from'] == e['id'] else ed['from']) in id_map]
+        lines = [
+            f'# {e["label"]} — Tier 2: Deep Context\n',
+            f'_File: `{e["file"]}` | Topic: {e["topic"]}_\n',
+            f'_Keywords: {", ".join(e["keywords"][:8])}_\n',
+            f'_Words: {e.get("word_count",0):,} | Reading time: ~{e.get("read_minutes",1)} min_\n',
+        ]
+        if e.get('summary'):
+            lines += ['\n## Summary\n', e['summary'], '']
+        if e.get('ast_nodes'):
+            lines += ['\n## Code Structure\n'] + [f'- `{n}`' for n in e['ast_nodes'][:12]]
+        lines += ['\n## Content\n', e['text'].strip()[:5000] + ('\n\n_[truncated]_' if len(e['text']) > 5000 else '')]
+        if related:
+            lines.append('\n## Connections\n')
+            for other, ed in related:
+                lines.append(f'- **{other["label"]}** [{ed["type"]}] — {", ".join(ed["shared_keywords"][:3]) or ed["relation"]}')
+        (t2 / f'{e["id"]}.md').write_text('\n'.join(lines), encoding='utf-8')
+
+    print(f'  Tiers: index + {len(topics)} topic files + {len(entities)} entity files')
+
+
+# ── Wiki generation ───────────────────────────────────────────────────────────
+
+def build_wiki(entities: List[dict], edges: List[dict], wiki_dir: Path, title: str):
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    edge_map: Dict[str, list] = defaultdict(list)
+    for edge in edges:
+        edge_map[edge['from']].append(edge)
+        edge_map[edge['to']].append(edge)
+    id_map = {e['id']: e for e in entities}
+    topics: Dict[str, list] = defaultdict(list)
+    for e in entities:
+        topics[e['topic']].append(e)
+
+    for e in entities:
+        topic = e['topic']
+        (wiki_dir / topic).mkdir(exist_ok=True)
+        related_edges = sorted(edge_map[e['id']], key=lambda x: -x['weight'])[:6]
+        related = [(id_map[ed['to'] if ed['from'] == e['id'] else ed['from']], ed)
+                   for ed in related_edges if (ed['to'] if ed['from'] == e['id'] else ed['from']) in id_map]
+        content = re.sub(r'\n{3,}', '\n\n', e['text'].strip())
+        if len(content) > 4000:
+            content = content[:4000] + '\n\n_[truncated]_'
+        lines = [
+            f'---\ntitle: "{e["label"]}"\ntopic: {topic}\ntags: [{topic}]\nfile: {e["file"]}\n---\n\n',
+            f'# {e["label"]}\n\n',
+            f'> **File:** `{e["file"]}` | **Topic:** {topic}\n\n',
+        ]
+        if e.get('ast_nodes'):
+            lines += ['## Structure\n'] + [f'- `{n}`' for n in e['ast_nodes'][:8]] + ['\n']
+        lines.append(content)
+        if related:
+            lines.append('\n\n## Related\n')
+            for other, ed in related:
+                tag = f' [{ed["type"]}]' if ed['type'] == 'EXTRACTED' else ''
+                shared = ', '.join(ed['shared_keywords'][:3])
+                lines.append(f'- [[{other["topic"]}/{other["id"]}|{other["label"]}]]{tag} — _{shared or ed["relation"]}_')
+        lines.append(f'\n\n---\n_[View in graph](../../graph/graph.html) | [Deep context](../../tiers/entity/{e["id"]}.md)_\n')
+        (wiki_dir / topic / f'{e["id"]}.md').write_text(''.join(lines), encoding='utf-8')
+
+    for topic, ents in topics.items():
+        lines = [f'---\ntags: [{topic}, overview]\n---\n\n# {topic.replace("-"," ").title()}\n\n']
+        for e in ents:
+            lines.append(f'- [[{topic}/{e["id"]}|{e["label"]}]] ({len(edge_map[e["id"]])} connections)')
+        (wiki_dir / topic / '_overview.md').write_text('\n'.join(lines), encoding='utf-8')
+
+    moc = [f'---\ntags: [index]\n---\n\n# {title} — Map of Content\n\n',
+           f'_Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}_\n']
+    for topic, ents in sorted(topics.items()):
+        moc.append(f'\n## {topic.replace("-"," ").title()} ({len(ents)})\n')
+        for e in ents:
+            moc.append(f'- [[{topic}/{e["id"]}|{e["label"]}]]')
+    (wiki_dir / 'index.md').write_text('\n'.join(moc), encoding='utf-8')
+
+    obs = wiki_dir / '.obsidian'
+    obs.mkdir(exist_ok=True)
+    groups = [{'query': f'path:{t}', 'color': {'a': 1, 'rgb': int(TOPIC_COLORS.get(t, '#888888')[1:], 16)}, 'lineStyle': 0}
+              for t in topics if t in TOPIC_COLORS]
+    (obs / 'graph.json').write_text(json.dumps({'colorGroups': groups, 'showTags': True}, indent=2))
+    (obs / 'app.json').write_text(json.dumps({'showLineNumber': True, 'readableLineLength': True, 'showFrontmatter': False}, indent=2))
+
+    total = len(list(wiki_dir.rglob('*.md')))
+    print(f'  Wiki: {total} pages across {len(topics)} topics')
+
+
+# ── Graph (vis.js + report) ───────────────────────────────────────────────────
+
+def build_graph(entities: List[dict], edges: List[dict], graph_dir: Path,
+                title: str, communities: Dict[str, int]):
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    edge_map: Dict[str, list] = defaultdict(list)
+    for edge in edges:
+        edge_map[edge['from']].append(edge)
+        edge_map[edge['to']].append(edge)
+
+    nodes = [{
+        'id': e['id'], 'label': e['label'], 'topic': e['topic'], 'file': e['file'],
+        'keywords': e['keywords'][:8], 'degree': len(edge_map[e['id']]),
+        'community': communities.get(e['id'], 0),
+        'color': TOPIC_COLORS.get(e['topic'], '#BDC3C7'),
+        'size': 12 + min(len(edge_map[e['id']]) * 3, 28),
+        'is_code': e.get('is_code', False),
+    } for e in entities]
+
+    n_comm = max(communities.values(), default=0) + 1
+    stats = {
+        'total_nodes': len(nodes), 'total_edges': len(edges), 'communities': n_comm,
+        'topics': sorted(set(e['topic'] for e in entities)),
+        'extracted': sum(1 for e in edges if e['type'] == 'EXTRACTED'),
+        'inferred': sum(1 for e in edges if e['type'] == 'INFERRED'),
+        'ambiguous': sum(1 for e in edges if e['type'] == 'AMBIGUOUS'),
+    }
+    (graph_dir / 'graph.json').write_text(json.dumps(
+        {'generated_at': datetime.now().isoformat(), 'title': title,
+         'nodes': nodes, 'edges': edges, 'stats': stats}, indent=2), encoding='utf-8')
+
+    # Report
+    id_to_label = {n['id']: n['label'] for n in nodes}
+    hub_nodes = sorted(nodes, key=lambda n: -n['degree'])[:5]
+    strong_edges = sorted([e for e in edges if e['weight'] >= 8], key=lambda x: -x['weight'])[:5]
+    topic_counts = Counter(e['topic'] for e in entities)
+    isolated = [n for n in nodes if n['degree'] == 0]
+
+    report = [
+        f'# {title} — Graph Report\n',
+        f'_Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}_\n\n',
+        f'## Statistics\n',
+        f'- **Nodes:** {stats["total_nodes"]} | **Connections:** {stats["total_edges"]} | **Clusters:** {stats["communities"]}',
+        f'- **Edge confidence:** EXTRACTED (AST): {stats["extracted"]} | INFERRED: {stats["inferred"]} | AMBIGUOUS: {stats["ambiguous"]}\n',
+        f'## Hub Nodes (most connected)\n',
+    ] + [f'- **{n["label"]}** ({n["topic"]}) — {n["degree"]} connections' for n in hub_nodes]
+    report += [f'\n## Topics\n'] + [f'- **{t.replace("-"," ").title()}**: {c} entities' for t, c in topic_counts.most_common()]
+    if strong_edges:
+        report += [f'\n## Strongest Connections\n'] + [
+            f'- **{id_to_label.get(e["from"], e["from"])}** ↔ **{id_to_label.get(e["to"], e["to"])}** [{e["type"]}] — {", ".join(e["shared_keywords"][:3]) or e["relation"]}'
+            for e in strong_edges]
+    if isolated:
+        report += [f'\n## Knowledge Gaps ({len(isolated)} isolated nodes)\n'] + [
+            f'- **{n["label"]}** has no connections' for n in isolated[:5]]
+    report += [
+        f'\n## Suggested Questions\n',
+        f'- What is the role of **{hub_nodes[0]["label"]}** in this project?' if hub_nodes else '',
+        f'- How does **{hub_nodes[0]["label"]}** connect to **{hub_nodes[1]["label"]}**?' if len(hub_nodes) > 1 else '',
+        f'- What are the key themes across all {len(stats["topics"])} topics?',
+        f'- Review {stats["ambiguous"]} ambiguous connections for accuracy' if stats['ambiguous'] else '',
+        f'\n---\n_[Open graph](graph.html) | [Wiki](../wiki/index.md) | [Tiers](../tiers/index.md)_\n',
+    ]
+    (graph_dir / 'report.md').write_text('\n'.join(r for r in report if r is not None), encoding='utf-8')
+    print(f'  Report: graph/report.md')
+
+    # Only show strong edges to avoid hairball effect
+    strong_edges = [e for e in edges if e['weight'] >= 7]
+    if len(strong_edges) < 10:
+        strong_edges = sorted(edges, key=lambda x: -x['weight'])[:max(len(nodes)*2, 20)]
+
+    topics_list = sorted(set(n['topic'] for n in nodes))
+
+    # Node data enriched
+    node_data = json.dumps([{
+        'id': n['id'],
+        'label': n['label'],
+        'topic': n['topic'],
+        'color': n['color'],
+        'degree': n['degree'],
+        'community': n['community'],
+        'keywords': n['keywords'],
+        'file': n['file'],
+        'summary': next((e.get('summary','') for e in entities if e['id']==n['id']), ''),
+    } for n in nodes])
+
+    edge_data = json.dumps([{
+        'from': e['from'], 'to': e['to'],
+        'weight': e['weight'], 'type': e['type'],
+        'shared': e['shared_keywords'][:3],
+    } for e in strong_edges])
+
+    topic_legend = json.dumps({t: TOPIC_COLORS.get(t, '#BDC3C7') for t in topics_list})
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><title>{title} — Knowledge Graph</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+html,body{{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;overflow:hidden}}
+
+/* Header */
+#hdr{{height:52px;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 20px;gap:16px;flex-shrink:0}}
+#hdr-title{{font-size:15px;font-weight:700;display:flex;align-items:center;gap:8px}}
+#search-wrap{{flex:1;max-width:320px;position:relative}}
+#search{{width:100%;padding:7px 14px 7px 34px;background:#21262d;border:1px solid #30363d;border-radius:20px;color:#e6edf3;font-size:13px;outline:none}}
+#search:focus{{border-color:#388bfd}}
+#search-wrap::before{{content:'🔍';position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:13px;pointer-events:none}}
+.stat-pill{{background:#21262d;border:1px solid #30363d;border-radius:20px;padding:4px 12px;font-size:11px;color:#8b949e;white-space:nowrap}}
+#btn-fit{{padding:6px 14px;background:#388bfd;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;margin-left:auto}}
+#btn-fit:hover{{background:#1f6feb}}
+
+/* Layout */
+#layout{{display:flex;height:calc(100vh - 52px)}}
+
+/* Sidebar */
+#sb{{width:200px;background:#161b22;border-right:1px solid #30363d;display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}}
+#sb-tabs{{display:flex;border-bottom:1px solid #30363d}}
+.tab{{flex:1;padding:10px;text-align:center;font-size:11px;font-weight:600;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent}}
+.tab.active{{color:#e6edf3;border-bottom-color:#388bfd}}
+#sb-content{{flex:1;overflow-y:auto;padding:12px}}
+.topic-item{{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;margin-bottom:2px;transition:background .15s}}
+.topic-item:hover{{background:#21262d}}
+.topic-item.active{{background:#21262d}}
+.topic-dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0}}
+.topic-name{{font-size:12px;color:#c9d1d9;flex:1}}
+.topic-count{{font-size:10px;color:#8b949e;background:#0d1117;padding:1px 6px;border-radius:8px}}
+.nav-link{{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;color:#c9d1d9;text-decoration:none;font-size:12px;margin-bottom:2px;transition:background .15s}}
+.nav-link:hover{{background:#21262d}}
+#sb-section{{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#484f58;margin:12px 0 6px;font-weight:600}}
+
+/* Graph */
+#graph{{flex:1;position:relative}}
+#graph-canvas{{width:100%;height:100%}}
+#loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#0d1117;font-size:14px;color:#8b949e;flex-direction:column;gap:12px}}
+.spinner{{width:32px;height:32px;border:3px solid #30363d;border-top-color:#388bfd;border-radius:50%;animation:spin .8s linear infinite}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+
+/* Detail panel */
+#detail{{width:280px;background:#161b22;border-left:1px solid #30363d;display:flex;flex-direction:column;flex-shrink:0;transform:translateX(100%);transition:transform .2s;position:absolute;right:0;top:0;height:100%}}
+#detail.open{{transform:translateX(0);position:relative}}
+#detail-close{{position:absolute;top:12px;right:12px;background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer;line-height:1}}
+#detail-close:hover{{color:#e6edf3}}
+#detail-inner{{padding:20px;overflow-y:auto;flex:1}}
+#d-topic{{display:inline-block;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;margin-bottom:10px}}
+#d-title{{font-size:14px;font-weight:700;color:#fff;line-height:1.4;margin-bottom:8px}}
+#d-summary{{font-size:12px;color:#8b949e;line-height:1.6;margin-bottom:12px;font-style:italic}}
+#d-stats{{display:flex;gap:8px;margin-bottom:14px}}
+.d-stat{{background:#21262d;border-radius:6px;padding:6px 10px;text-align:center;flex:1}}
+.d-stat-n{{font-size:18px;font-weight:700;color:#388bfd}}
+.d-stat-l{{font-size:10px;color:#8b949e;margin-top:2px}}
+#d-kws{{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:14px}}
+.kw-tag{{background:#21262d;border:1px solid #30363d;padding:3px 9px;border-radius:10px;font-size:11px;color:#c9d1d9}}
+#d-connections{{margin-bottom:14px}}
+#d-connections h4{{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#484f58;margin-bottom:8px}}
+.conn-item{{padding:7px 0;border-bottom:1px solid #21262d;font-size:12px}}
+.conn-label{{color:#c9d1d9;font-weight:500}}
+.conn-meta{{color:#8b949e;font-size:10px;margin-top:2px}}
+#d-actions{{display:flex;flex-direction:column;gap:6px}}
+.d-btn{{padding:9px 14px;border-radius:7px;font-size:12px;font-weight:600;text-decoration:none;text-align:center;border:1px solid #30363d;background:#21262d;color:#c9d1d9;cursor:pointer;transition:background .15s}}
+.d-btn:hover{{background:#30363d}}
+.d-btn.primary{{background:#388bfd;color:#fff;border-color:#388bfd}}
+.d-btn.primary:hover{{background:#1f6feb}}
+</style>
+</head>
+<body>
+
+<div id="hdr">
+  <div id="hdr-title">🧠 {title}</div>
+  <div id="search-wrap">
+    <input id="search" type="text" placeholder="Search papers...">
+  </div>
+  <span class="stat-pill">{len(nodes)} papers</span>
+  <span class="stat-pill">{len(strong_edges)} connections</span>
+  <span class="stat-pill">{n_comm} clusters</span>
+  <button id="btn-fit" onclick="net.fit({{animation:true}})">⊙ Fit</button>
+</div>
+
+<div id="layout">
+  <div id="sb">
+    <div id="sb-tabs">
+      <div class="tab active" onclick="switchTab(0)">Topics</div>
+      <div class="tab" onclick="switchTab(1)">Navigate</div>
+    </div>
+    <div id="sb-content">
+      <div id="tab-topics"></div>
+      <div id="tab-nav" style="display:none">
+        <div id="sb-section">Views</div>
+        <a class="nav-link" href="../index.html">🏠 Dashboard</a>
+        <a class="nav-link" href="report.md">📊 Graph Report</a>
+        <div id="sb-section">Study</div>
+        <a class="nav-link" href="../wiki/index.md">📖 Obsidian Wiki</a>
+        <a class="nav-link" href="../tiers/index.md">📦 Context Tiers</a>
+        <a class="nav-link" href="../bibliography.md">📚 Bibliography</a>
+        <a class="nav-link" href="../reading-order.md">📋 Reading List</a>
+        <a class="nav-link" href="../insights.md">🔍 Insights</a>
+      </div>
+    </div>
+  </div>
+
+  <div id="graph">
+    <div id="loading"><div class="spinner"></div><span>Building graph...</span></div>
+    <div id="graph-canvas"></div>
+  </div>
+
+  <div id="detail">
+    <button id="detail-close" onclick="closeDetail()">✕</button>
+    <div id="detail-inner">
+      <div id="d-topic"></div>
+      <div id="d-title"></div>
+      <div id="d-summary"></div>
+      <div id="d-stats">
+        <div class="d-stat"><div class="d-stat-n" id="d-conn-n">0</div><div class="d-stat-l">Connections</div></div>
+        <div class="d-stat"><div class="d-stat-n" id="d-clust-n">0</div><div class="d-stat-l">Cluster</div></div>
+      </div>
+      <div id="d-kws"></div>
+      <div id="d-connections"><h4>Connected to</h4><div id="d-conn-list"></div></div>
+      <div id="d-actions">
+        <a id="d-wiki" class="d-btn primary" href="#">📖 Open Wiki page</a>
+        <a id="d-tier" class="d-btn" href="#">📦 Deep context</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const NODES = {node_data};
+const EDGES = {edge_data};
+const TOPIC_COLORS = {topic_legend};
+const nodeMap = {{}};
+NODES.forEach(n => nodeMap[n.id] = n);
+
+// Build edge map for connections panel
+const edgeMap = {{}};
+EDGES.forEach(e => {{
+  if (!edgeMap[e.from]) edgeMap[e.from] = [];
+  if (!edgeMap[e.to])   edgeMap[e.to]   = [];
+  edgeMap[e.from].push({{peer: e.to,   shared: e.shared, type: e.type}});
+  edgeMap[e.to].push(  {{peer: e.from, shared: e.shared, type: e.type}});
+}});
+
+// Build topic list
+const topicCounts = {{}};
+NODES.forEach(n => topicCounts[n.topic] = (topicCounts[n.topic]||0)+1);
+let activeTopic = null;
+const topicEl = document.getElementById('tab-topics');
+Object.entries(topicCounts).sort((a,b)=>b[1]-a[1]).forEach(([t,c]) => {{
+  const col = TOPIC_COLORS[t] || '#888';
+  const el = document.createElement('div');
+  el.className = 'topic-item'; el.dataset.topic = t;
+  el.innerHTML = `<div class="topic-dot" style="background:${{col}}"></div>
+    <span class="topic-name">${{t.replace(/-/g,' ')}}</span>
+    <span class="topic-count">${{c}}</span>`;
+  el.onclick = () => filterByTopic(t, el);
+  topicEl.appendChild(el);
+}});
+
+// vis.js datasets
+const maxDeg = Math.max(...NODES.map(n=>n.degree), 1);
+const visNodes = new vis.DataSet(NODES.map(n => ({{
+  id: n.id,
+  label: n.label.length > 22 ? n.label.slice(0,22)+'…' : n.label,
+  color: {{
+    background: n.color,
+    border: n.color,
+    highlight: {{background: '#fff', border: n.color}},
+    hover: {{background: n.color, border: '#fff'}},
+  }},
+  size: 10 + (n.degree / maxDeg) * 30,
+  font: {{color:'#e6edf3', size: 11, face:'system-ui'}},
+  topic: n.topic,
+  borderWidth: 2,
+  shadow: {{enabled:true, color:'rgba(0,0,0,0.4)', size:6}},
+}})));
+
+const visEdges = new vis.DataSet(EDGES.map(e => ({{
+  from: e.from, to: e.to,
+  width: e.type === 'EXTRACTED' ? 2.5 : 1,
+  color: {{
+    color: e.type === 'EXTRACTED' ? '#388bfd44' : '#30363d',
+    highlight: '#388bfd',
+    hover: '#58a6ff',
+  }},
+  smooth: {{type:'curvedCW', roundness:0.1}},
+  dashes: e.type === 'AMBIGUOUS',
+}})));
+
+const net = new vis.Network(
+  document.getElementById('graph-canvas'),
+  {{nodes: visNodes, edges: visEdges}},
+  {{
+    physics: {{
+      stabilization: {{iterations:150, fit:true}},
+      barnesHut: {{
+        gravitationalConstant: -6000,
+        centralGravity: 0.3,
+        springLength: 160,
+        springConstant: 0.04,
+        damping: 0.12,
+      }},
+    }},
+    interaction: {{hover:true, tooltipDelay:200, hideEdgesOnDrag:true}},
+    nodes: {{shape:'dot'}},
+    edges: {{selectionWidth:3}},
+  }}
+);
+
+net.once('stabilizationIterationsDone', () => {{
+  document.getElementById('loading').style.display = 'none';
+  net.fit({{animation:{{duration:600, easingFunction:'easeInOutQuad'}}}});
+}});
+
+// Click handler
+net.on('click', p => {{
+  if (!p.nodes.length) {{ closeDetail(); return; }}
+  openDetail(p.nodes[0]);
+}});
+
+function openDetail(id) {{
+  const n = nodeMap[id];
+  if (!n) return;
+  const col = TOPIC_COLORS[n.topic] || '#888';
+  document.getElementById('d-topic').textContent = n.topic.replace(/-/g,' ');
+  document.getElementById('d-topic').style.background = col + '33';
+  document.getElementById('d-topic').style.color = col;
+  document.getElementById('d-title').textContent = n.label;
+  document.getElementById('d-summary').textContent = n.summary || '';
+  document.getElementById('d-conn-n').textContent = n.degree;
+  document.getElementById('d-clust-n').textContent = n.community;
+  document.getElementById('d-kws').innerHTML = (n.keywords||[]).map(k=>`<span class="kw-tag">${{k}}</span>`).join('');
+  const conns = (edgeMap[id]||[]).slice(0,6);
+  document.getElementById('d-conn-list').innerHTML = conns.map(c => {{
+    const peer = nodeMap[c.peer];
+    if (!peer) return '';
+    return `<div class="conn-item">
+      <div class="conn-label">${{peer.label.slice(0,50)}}</div>
+      <div class="conn-meta">${{c.shared.join(', ') || c.type}}</div>
+    </div>`;
+  }}).join('');
+  document.getElementById('d-wiki').href = `../wiki/${{n.topic}}/${{id}}.md`;
+  document.getElementById('d-tier').href = `../tiers/entity/${{id}}.md`;
+  document.getElementById('detail').classList.add('open');
+}}
+
+function closeDetail() {{
+  document.getElementById('detail').classList.remove('open');
+}}
+
+// Search
+document.getElementById('search').addEventListener('input', function() {{
+  const q = this.value.toLowerCase().trim();
+  visNodes.forEach(n => {{
+    const node = nodeMap[n.id];
+    const match = !q || node.label.toLowerCase().includes(q) ||
+                  (node.keywords||[]).some(k=>k.includes(q)) ||
+                  node.topic.includes(q);
+    visNodes.update({{id:n.id, opacity: match ? 1 : 0.1,
+                     font: {{color: match ? '#e6edf3' : '#333'}}}});
+  }});
+}});
+
+// Topic filter
+function filterByTopic(topic, el) {{
+  if (activeTopic === topic) {{
+    activeTopic = null;
+    document.querySelectorAll('.topic-item').forEach(e=>e.classList.remove('active'));
+    visNodes.forEach(n=>visNodes.update({{id:n.id,opacity:1,font:{{color:'#e6edf3'}}}}));
+  }} else {{
+    activeTopic = topic;
+    document.querySelectorAll('.topic-item').forEach(e=>e.classList.remove('active'));
+    el.classList.add('active');
+    visNodes.forEach(n=>{{
+      const match = nodeMap[n.id].topic === topic;
+      visNodes.update({{id:n.id, opacity:match?1:0.08, font:{{color:match?'#e6edf3':'#333'}}}});
+    }});
+  }}
+}}
+
+// Tab switch
+const tabs = document.querySelectorAll('.tab');
+function switchTab(i) {{
+  tabs.forEach((t,j)=>t.classList.toggle('active',i===j));
+  document.getElementById('tab-topics').style.display = i===0?'':'none';
+  document.getElementById('tab-nav').style.display    = i===1?'':'none';
+}}
+</script>
+</body>
+</html>"""
+    (graph_dir / 'graph.html').write_text(html, encoding='utf-8')
+    print(f'  Graph: graph/graph.html ({len(nodes)} nodes, {len(strong_edges)} edges, {n_comm} clusters)')
+    return stats
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+def build_dashboard(entities: List[dict], edges: List[dict], out_dir: Path, title: str, stats: dict):
+    topics: Dict[str, list] = defaultdict(list)
+    for e in entities:
+        topics[e['topic']].append(e)
+    # Topic cards with tag clouds
+    def topic_tags(ents):
+        all_kw = Counter()
+        for e in ents:
+            for kw in e['keywords'][:5]:
+                all_kw[kw] += 1
+        return ' '.join(f'<span class="tag">{kw}</span>' for kw, _ in all_kw.most_common(5))
+
+    cards = ''.join(
+        f'<div class="card"><div style="width:10px;height:36px;border-radius:4px;background:{TOPIC_COLORS.get(t,"#888")};flex-shrink:0"></div>'
+        f'<div><div class="ct">{t.replace("-"," ").title()}</div>'
+        f'<div class="cs">{len(ents)} papers</div>'
+        f'<div class="tags">{topic_tags(ents)}</div></div></div>'
+        for t, ents in sorted(topics.items()))
+
+    # Build search index — id, label, topic, keywords, summary
+    search_data = json.dumps([{
+        'id': e['id'],
+        'label': e['label'],
+        'topic': e['topic'],
+        'keywords': ' '.join(e['keywords']),
+        'summary': e.get('summary', '')[:200],
+        'file': e['file'],
+    } for e in entities], ensure_ascii=False)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><title>{title}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh}}
+.hero{{padding:60px 40px 30px;text-align:center}}
+.hero h1{{font-size:32px;font-weight:700;color:#fff;margin-bottom:8px}}
+.hero p{{font-size:13px;color:#8b949e;margin-bottom:4px}}
+.stats{{display:flex;gap:14px;justify-content:center;margin:26px 0;flex-wrap:wrap}}
+.stat{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px 26px;text-align:center}}
+.sn{{font-size:28px;font-weight:700;color:#388bfd}}.sl{{font-size:12px;color:#8b949e;margin-top:2px}}
+.conf{{display:flex;gap:10px;justify-content:center;margin-bottom:24px;flex-wrap:wrap}}
+.badge{{padding:4px 12px;border-radius:10px;font-size:12px;font-weight:600}}
+.EX{{background:#1f6feb33;color:#58a6ff}}.IN{{background:#388bfd22;color:#79c0ff}}.AM{{background:#f0883e22;color:#f0883e}}
+.actions{{display:flex;gap:12px;justify-content:center;margin-bottom:30px;flex-wrap:wrap}}
+.btn{{padding:10px 22px;border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;transition:opacity .2s}}
+.bp{{background:#388bfd;color:#fff}}.bs{{background:#21262d;color:#e6edf3;border:1px solid #30363d}}
+.btn:hover{{opacity:.85}}
+.search-wrap{{max-width:600px;margin:0 auto 40px;padding:0 20px}}
+.search-box{{width:100%;padding:12px 18px;font-size:15px;background:#161b22;border:1px solid #30363d;border-radius:10px;color:#e6edf3;outline:none}}
+.search-box:focus{{border-color:#388bfd}}
+.search-box::placeholder{{color:#484f58}}
+#search-results{{margin-top:10px;display:none}}
+.sr{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:6px}}
+.sr-title{{font-size:14px;font-weight:600;color:#e6edf3}}
+.sr-meta{{font-size:11px;color:#8b949e;margin-top:2px}}
+.sr-summary{{font-size:12px;color:#c9d1d9;margin-top:6px;line-height:1.5}}
+.sr-link{{font-size:11px;color:#388bfd;text-decoration:none;margin-top:4px;display:inline-block}}
+.no-results{{color:#8b949e;font-size:13px;text-align:center;padding:20px}}
+.sec{{max-width:860px;margin:0 auto;padding:0 40px 50px}}
+.sec h2{{font-size:15px;font-weight:600;margin-bottom:12px;color:#c9d1d9}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px;display:flex;align-items:center;gap:10px}}
+.ct{{font-size:13px;font-weight:500}}.cs{{font-size:11px;color:#8b949e;margin-top:2px}}
+.tags{{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}}
+.tag{{background:#21262d;color:#8b949e;font-size:10px;padding:2px 7px;border-radius:8px;border:1px solid #30363d}}
+footer{{text-align:center;padding:20px;font-size:11px;color:#484f58}}
+</style>
+</head>
+<body>
+<div class="hero">
+  <h1>🧠 {title}</h1>
+  <p>Second Brain T v1.0</p>
+  <p style="color:#484f58;font-size:11px">{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+  <div class="stats">
+    <div class="stat"><div class="sn">{len(entities)}</div><div class="sl">Documents</div></div>
+    <div class="stat"><div class="sn">{len(edges)}</div><div class="sl">Connections</div></div>
+    <div class="stat"><div class="sn">{len(topics)}</div><div class="sl">Topics</div></div>
+    <div class="stat"><div class="sn">{stats.get("communities",0)}</div><div class="sl">Clusters</div></div>
+  </div>
+  <div class="conf">
+    <span class="badge EX">AST/Imports: {stats.get("extracted",0)}</span>
+    <span class="badge IN">Inferred: {stats.get("inferred",0)}</span>
+    <span class="badge AM">Ambiguous: {stats.get("ambiguous",0)}</span>
+  </div>
+  <div class="actions">
+    <a href="graph/graph.html" class="btn bp">🔗 Knowledge Graph</a>
+    <a href="wiki/index.md" class="btn bs">📖 Obsidian Wiki</a>
+    <a href="tiers/index.md" class="btn bs">📦 Context Tiers</a>
+    <a href="graph/report.md" class="btn bs">📊 Report</a>
+    <a href="bibliography.md" class="btn bs">📚 Bibliography</a>
+    <a href="reading-order.md" class="btn bs">📋 Reading List</a>
+    <a href="insights.md" class="btn bs">🔍 Insights</a>
+  </div>
+</div>
+
+<div class="search-wrap">
+  <input class="search-box" type="text" id="search" placeholder="Search papers, topics, keywords..." autocomplete="off">
+  <div id="search-results"></div>
+</div>
+
+<div class="sec"><h2>Topics</h2><div class="cards">{cards}</div></div>
+<footer>Second Brain T v1.0 &nbsp;·&nbsp; MIT</footer>
+
+<script>
+const DATA = {search_data};
+const input = document.getElementById('search');
+const results = document.getElementById('search-results');
+
+input.addEventListener('input', () => {{
+  const q = input.value.trim().toLowerCase();
+  if (!q) {{ results.style.display = 'none'; results.innerHTML = ''; return; }}
+  const hits = DATA.filter(e =>
+    e.label.toLowerCase().includes(q) ||
+    e.topic.toLowerCase().includes(q) ||
+    e.keywords.toLowerCase().includes(q) ||
+    e.summary.toLowerCase().includes(q)
+  ).slice(0, 12);
+  results.style.display = 'block';
+  if (!hits.length) {{
+    results.innerHTML = '<div class="no-results">No results found</div>';
+    return;
+  }}
+  results.innerHTML = hits.map(e => `
+    <div class="sr">
+      <div class="sr-title">${{e.label}}</div>
+      <div class="sr-meta">${{e.topic}} &nbsp;·&nbsp; ${{e.keywords.split(' ').slice(0,4).join(', ')}}</div>
+      ${{e.summary ? `<div class="sr-summary">${{e.summary}}</div>` : ''}}
+      <a class="sr-link" href="tiers/entity/${{e.id}}.md">→ Deep context</a>
+    </div>`).join('');
+}});
+</script>
+</body>
+</html>"""
+    (out_dir / 'index.html').write_text(html, encoding='utf-8')
+    print(f'  Dashboard: index.html')
+
+
+# ── Reading list ──────────────────────────────────────────────────────────────
+
+def build_reading_list(entities: List[dict], edges: List[dict], out_dir: Path, title: str):
+    """Generate a suggested reading order based on connection count (most connected = most foundational)."""
+    degree: Dict[str, int] = defaultdict(int)
+    for edge in edges:
+        degree[edge['from']] += 1
+        degree[edge['to']] += 1
+
+    id_map = {e['id']: e for e in entities}
+    ranked = sorted(entities, key=lambda e: -degree[e['id']])
+
+    lines = [
+        f'# {title} — Suggested Reading Order\n',
+        f'_Papers ranked by how many connections they have — most foundational first._\n',
+        f'_Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}_\n',
+        '\n---\n',
+    ]
+
+    topics_seen: Dict[str, list] = defaultdict(list)
+    for e in ranked:
+        topics_seen[e['topic']].append(e)
+
+    rank = 1
+    for topic, ents in sorted(topics_seen.items(), key=lambda x: -sum(degree[e['id']] for e in x[1])):
+        lines.append(f'\n## {topic.replace("-"," ").title()}\n')
+        for e in ents:
+            mins = e.get('read_minutes', 1)
+            conn = degree[e['id']]
+            c = e['citation']
+            auth = c['authors'].split(',')[0] if c['authors'] else ''
+            year = c['year'] or 'n.d.'
+            label = f'{auth} ({year})' if auth else e['label'][:60]
+            lines.append(f'{rank}. **{label}** — {conn} connections · ~{mins} min read')
+            if e.get('summary'):
+                lines.append(f'   > {e["summary"][:150]}...')
+            lines.append('')
+            rank += 1
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'reading-order.md').write_text('\n'.join(lines), encoding='utf-8')
+    print(f'  Reading list: reading-order.md')
+
+
+# ── Duplicate detection ────────────────────────────────────────────────────────
+
+def detect_duplicates(entities: List[dict]) -> List[Tuple[dict, dict, float]]:
+    """Find pairs of documents that look like duplicates (keyword overlap > 70%)."""
+    duplicates = []
+    for i, a in enumerate(entities):
+        for b in entities[i+1:]:
+            kw_a = set(a['keywords'])
+            kw_b = set(b['keywords'])
+            if not kw_a or not kw_b:
+                continue
+            overlap = len(kw_a & kw_b) / len(kw_a | kw_b)
+            if overlap >= 0.70:
+                duplicates.append((a, b, overlap))
+    return sorted(duplicates, key=lambda x: -x[2])
+
+
+# ── Gap detection ──────────────────────────────────────────────────────────────
+
+def detect_gaps(entities: List[dict], edges: List[dict]) -> List[dict]:
+    """Find orphan documents — connected to fewer than 2 others."""
+    degree: Dict[str, int] = defaultdict(int)
+    for edge in edges:
+        degree[edge['from']] += 1
+        degree[edge['to']] += 1
+    return [e for e in entities if degree[e['id']] < 2]
+
+
+# ── Insights report ────────────────────────────────────────────────────────────
+
+def build_insights(entities: List[dict], edges: List[dict], out_dir: Path, title: str):
+    """Generate insights: duplicates, gaps, reading stats."""
+    duplicates = detect_duplicates(entities)
+    gaps = detect_gaps(entities, edges)
+    total_words = sum(e.get('word_count', 0) for e in entities)
+    total_mins = sum(e.get('read_minutes', 1) for e in entities)
+
+    lines = [
+        f'# {title} — Insights\n',
+        f'_Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}_\n',
+        '\n---\n',
+        f'\n## 📊 Reading Stats\n',
+        f'- **Total documents:** {len(entities)}',
+        f'- **Total words:** {total_words:,}',
+        f'- **Total reading time:** ~{total_mins} minutes (~{total_mins//60}h {total_mins%60}m)',
+        f'- **Average per paper:** ~{total_words//max(len(entities),1):,} words · ~{total_mins//max(len(entities),1)} min',
+    ]
+
+    if duplicates:
+        lines += [f'\n## ⚠️ Possible Duplicates ({len(duplicates)} pairs)\n',
+                  '_These pairs share 70%+ of their keywords — may be the same paper downloaded twice._\n']
+        for a, b, score in duplicates[:10]:
+            lines.append(f'- **{a["label"][:60]}**')
+            lines.append(f'  ↔ **{b["label"][:60]}** ({score:.0%} overlap)')
+            lines.append('')
+    else:
+        lines += ['\n## ✅ No Duplicates Found\n']
+
+    if gaps:
+        lines += [f'\n## 🔍 Orphan Documents ({len(gaps)} files)\n',
+                  '_These documents have fewer than 2 connections — possibly misclassified or very different from the rest._\n']
+        for e in gaps:
+            mins = e.get('read_minutes', 1)
+            lines.append(f'- **{e["label"][:80]}** ({e["topic"]}) · ~{mins} min')
+    else:
+        lines += ['\n## ✅ No Orphans Found\n']
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'insights.md').write_text('\n'.join(lines), encoding='utf-8')
+    print(f'  Insights: insights.md')
+
+
+# ── Citation export ───────────────────────────────────────────────────────────
+
+def build_citations(entities: List[dict], out_dir: Path, title: str):
+    """Generate a .bib file and a readable bibliography markdown."""
+    bib_lines = []
+    md_lines = [f'# {title} — Bibliography\n', f'_Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")} | {len(entities)} sources_\n']
+
+    topics: Dict[str, list] = defaultdict(list)
+    for e in entities:
+        topics[e['topic']].append(e)
+
+    for topic, ents in sorted(topics.items()):
+        md_lines.append(f'\n## {topic.replace("-", " ").title()}\n')
+        for e in sorted(ents, key=lambda x: x['citation'].get('year', '0000'), reverse=True):
+            c = e['citation']
+            key = slugify(f'{c["authors"][:20] if c["authors"] else e["id"]}-{c["year"] or "nd"}')
+            title_bib = c['title'].replace('{', '').replace('}', '')
+            year = c['year'] or 'n.d.'
+            authors = c['authors'] or 'Unknown'
+
+            # BibTeX entry
+            bib_lines.append(f'@misc{{{key},')
+            bib_lines.append(f'  title = {{{title_bib}}},')
+            bib_lines.append(f'  author = {{{authors}}},')
+            bib_lines.append(f'  year = {{{year}}},')
+            bib_lines.append(f'  note = {{File: {e["file"]}}}')
+            bib_lines.append('}\n')
+
+            # Readable markdown entry
+            summary_line = f' — _{e["summary"][:150]}..._' if e.get('summary') else ''
+            md_lines.append(f'- **{c["title"][:100]}** ({authors}, {year}){summary_line}')
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'bibliography.bib').write_text('\n'.join(bib_lines), encoding='utf-8')
+    (out_dir / 'bibliography.md').write_text('\n'.join(md_lines), encoding='utf-8')
+    print(f'  Citations: bibliography.bib + bibliography.md')
+
+
+# ── Claude skill installer ─────────────────────────────────────────────────────
+
+def install_skill(target: Path):
+    skill_dir = target / '.claude' / 'skills' / 'second-brain-t'
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / 'SKILL.md').write_text(
+        '---\nname: second-brain-t\ndescription: Use when the user wants to build a knowledge base, '
+        'analyze a project, create a wiki, or build a knowledge graph.\n---\n\n'
+        '# /sbt\n\nRun: `python3 build.py <folder> [--pdf] [--no-cache]`\n\n'
+        '## Query\n1. Load `output/tiers/index.md` (Tier 0)\n'
+        '2. Load `output/tiers/topic/{topic}.md` (Tier 1)\n'
+        '3. Load `output/tiers/entity/{id}.md` (Tier 2)\n'
+        '4. See `output/graph/report.md` for connections\n',
+        encoding='utf-8')
+    cmd_dir = target / '.claude' / 'commands'
+    cmd_dir.mkdir(parents=True, exist_ok=True)
+    (cmd_dir / 'sbt.md').write_text(
+        '# /sbt — Query Second Brain T\n\n'
+        '```\n/sbt           # Stats\n/sbt compile   # Rebuild\n'
+        '/sbt search X  # Search tiers\n/sbt gaps      # Find orphans\n```\n\n'
+        'Always start from `output/tiers/index.md`, then drill into topic or entity files.\n',
+        encoding='utf-8')
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    target, title, use_cache, clear_output = parse_args()
+    if not target:
+        print('Usage: python3 build.py <folder> [--title "Name"] [--no-cache] [--clear] [--update]')
+        sys.exit(1)
+    if not target.exists():
+        print(f'Error: {target} not found')
+        sys.exit(1)
+
+    OUT = Path(__file__).parent / 'output'
+
+    print(f'\nSecond Brain T v1.0')
+    print(f'  Source : {target}')
+    print(f'  Output : {OUT}\n')
+
+    # Handle existing output
+    if OUT.exists() and any(OUT.iterdir()):
+        if clear_output is True:
+            import shutil; shutil.rmtree(OUT)
+            print('  Cleared.\n')
+        elif clear_output is False:
+            print('  Updating existing output.\n')
+        else:
+            # Interactive prompt (terminal only)
+            print('⚠️  Output folder already has content from a previous run.')
+            print('  [c] Clear and start fresh')
+            print('  [u] Update (keep existing files, add new ones)')
+            print('  [q] Quit')
+            try:
+                choice = input('\nYour choice (c/u/q): ').strip().lower()
+            except EOFError:
+                choice = 'u'
+            if choice == 'q':
+                print('Cancelled.')
+                sys.exit(0)
+            elif choice == 'c':
+                import shutil; shutil.rmtree(OUT)
+                print('  Cleared.\n')
+            else:
+                print('  Updating existing output.\n')
+
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    # Always auto-convert PDFs, Word docs, and PowerPoint files
+    pdfs = collect_pdfs(target)
+    docx_files = collect_docx(target)
+    pptx_files = collect_pptx(target)
+    if pdfs or docx_files or pptx_files:
+        total = len(pdfs) + len(docx_files) + len(pptx_files)
+        print(f'Found {total} document(s) to convert (PDF:{len(pdfs)} DOCX:{len(docx_files)} PPTX:{len(pptx_files)})...')
+        n = convert_pdfs(target) + convert_docx(target) + convert_pptx(target)
+        print(f'  {n} converted\n')
+
+    files = collect_files(target)
+    print(f'Scanning... {len(files)} files found')
+
+    cache = Cache(OUT, enabled=use_cache)
+    cached = sum(1 for f in files if cache.load(f))
+    print(f'  Cache: {cached}/{len(files)} files already cached\n')
+
+    print('Extracting entities...')
+    entities = build_entities(files, target, cache)
+    code_count = sum(1 for e in entities if e.get('is_code'))
+    print(f'  {len(entities)} entities ({code_count} with AST parsing)\n')
+
+    print('Finding relationships...')
+    edges = find_relationships(entities)
+    ex = sum(1 for e in edges if e['type'] == 'EXTRACTED')
+    inf = sum(1 for e in edges if e['type'] == 'INFERRED')
+    amb = sum(1 for e in edges if e['type'] == 'AMBIGUOUS')
+    print(f'  {len(edges)} connections — AST: {ex} | Inferred: {inf} | Ambiguous: {amb}\n')
+
+    print('Detecting communities...')
+    communities = detect_communities(entities, edges)
+    n_comm = max(communities.values(), default=0) + 1
+    print(f'  {n_comm} clusters\n')
+
+    print('Building outputs...')
+    build_tiers(entities, edges, OUT / 'tiers', title)
+    build_wiki(entities, edges, OUT / 'wiki', title)
+    stats = build_graph(entities, edges, OUT / 'graph', title, communities)
+    stats['communities'] = n_comm
+    build_citations(entities, OUT, title)
+    build_reading_list(entities, edges, OUT, title)
+    build_insights(entities, edges, OUT, title)
+    build_dashboard(entities, edges, OUT, title, stats)
+    install_skill(target)
+
+    (OUT / 'freshness.json').write_text(json.dumps({
+        'compiled_at': datetime.now().isoformat(),
+        'entities': len(entities), 'edges': len(edges),
+        'tool': 'Second Brain T v1.0',
+    }, indent=2), encoding='utf-8')
+
+    print(f'\n✓ Done!\n')
+    print(f'  Open  : {OUT / "index.html"}')
+    print(f'  Wiki  : Open {OUT / "wiki"} in Obsidian')
+    print(f'  Query : Ask Claude using /sbt\n')
+
+
+if __name__ == '__main__':
+    main()
