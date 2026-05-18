@@ -1,4 +1,4 @@
-# AGENTS.md — Oriel Personal Assistant
+# AGENTS.md — Personal Assistant
 
 ## Every Session (required)
 
