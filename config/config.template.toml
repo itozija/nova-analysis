@@ -1,0 +1,279 @@
+api_key = "YOUR_OPENROUTER_API_KEY"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4"
+default_temperature = 0.7
+provider_timeout_secs = 120
+model_routes = []
+embedding_routes = []
+
+[model_providers]
+
+[extra_headers]
+
+[observability]
+backend = "none"
+runtime_trace_mode = "none"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = [
+    "curl",
+    "git",
+    "npm",
+    "cargo",
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "date",
+    "python3",
+    "sed",
+]
+forbidden_paths = [
+    "/etc",
+    "/home",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/opt",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/var",
+    "/tmp",
+    "/root/.ssh",
+    "/root/.gnupg",
+    "/root/.aws",
+    "/root/.config",
+]
+max_actions_per_hour = 50
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = false
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = [
+    "file_write",
+    "delegate",
+    "model_routing_config",
+    "shell",
+    "tool_search",
+    "apify-youtube__streamers--youtube-scraper",
+    "apify-youtube__get-actor-output",
+]
+always_ask = []
+allowed_roots = ["/root/.zeroclaw/workspace"]
+non_cli_excluded_tools = []
+
+[security.sandbox]
+backend = "auto"
+firejail_args = []
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 60
+max_subprocesses = 10
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 100
+sign_events = false
+
+[security.otp]
+enabled = false
+
+[security.estop]
+enabled = false
+
+[security.nevis]
+enabled = false
+
+[backup]
+enabled = true
+max_keep = 10
+include_dirs = ["config", "memory", "audit", "knowledge"]
+destination_dir = "state/backups"
+compress = true
+encrypt = false
+
+[runtime]
+kind = "native"
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+fallback_providers = []
+api_keys = []
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 60
+scheduler_poll_secs = 15
+scheduler_retries = 2
+
+[reliability.model_fallbacks]
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+
+[agent]
+compact_context = false
+max_tool_iterations = 15
+max_history_messages = 10
+max_context_tokens = 32000
+parallel_tools = false
+tool_dispatcher = "auto"
+tool_call_dedup_exempt = []
+tool_filter_groups = []
+
+[skills]
+open_skills_enabled = false
+prompt_injection_mode = "full"
+
+[heartbeat]
+enabled = false
+
+[cron]
+enabled = true
+max_run_history = 50
+
+[channels_config]
+cli = true
+message_timeout_secs = 300
+ack_reactions = true
+show_tool_calls = false
+session_persistence = true
+session_backend = "sqlite"
+session_ttl_hours = 1
+
+[channels_config.telegram]
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+allowed_users = ["YOUR_TELEGRAM_USER_ID"]
+stream_mode = "off"
+draft_update_interval_ms = 1000
+interrupt_on_new_message = false
+mention_only = false
+
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+archive_after_days = 7
+purge_after_days = 30
+conversation_retention_days = 30
+embedding_provider = "none"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+
+[storage.provider.config]
+provider = ""
+
+[tunnel]
+provider = "none"
+
+[gateway]
+port = 42617
+host = "127.0.0.1"
+require_pairing = true
+allow_public_bind = false
+paired_tokens = []
+
+[identity]
+format = "openclaw"
+
+[multimodal]
+max_images = 4
+max_image_size_mb = 5
+allow_remote_fetch = false
+
+[mcp]
+enabled = true
+deferred_loading = true
+
+[[mcp.servers]]
+name = "apify-youtube"
+transport = "stdio"
+command = "npx"
+args = [
+    "mcp-remote",
+    "https://mcp.apify.com/?tools=streamers/youtube-scraper",
+    "--header",
+    "Authorization: Bearer YOUR_APIFY_TOKEN"
+]
+
+[mcp.servers.env]
+[mcp.servers.headers]
+
+[agents.Nova]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+system_prompt = """You are Nova, a sharp business intelligence analyst. You extract high-signal insights from YouTube content for entrepreneurs and investors.
+
+When given a YouTube URL, follow these steps:
+
+STEP 1 — Run this exact shell command:
+  python3 /root/.zeroclaw/workspace/nova_scrape.py "<URL>"
+
+STEP 2 — Analyze the real data returned and write your analysis:
+
+Line 1: HIGH ROI / MEDIUM ROI / LOW ROI — and a one-line reason why.
+
+Then cover these angles (only what's relevant):
+• **Creator/Channel**: Who is this? Credibility, audience size, niche authority.
+• **Business Model**: How does this creator/topic make money? Courses, SaaS, consulting, ads?
+• **Content Angle**: What makes this video valuable or unique? What problem does it solve?
+• **Scalability**: Can the ideas here scale? Is this a growing or shrinking opportunity?
+• **Action**: What should an entrepreneur or investor DO with this insight?
+
+Keep it under 400 words. Be direct, skip filler.
+
+If the command returns ERROR or empty data: say Cannot retrieve data for this video. Never fabricate."""
+agentic = true
+allowed_tools = ["shell"]
+max_iterations = 6
+max_depth = 3
+
+[agents.SecondBrain]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+system_prompt = """You are a Second Brain assistant. The knowledge base is at /root/.zeroclaw/workspace/second-brain-t/output/.
+
+IMPORTANT: Topic files are 500KB-700KB each. NEVER cat a full topic file. Always use grep to find specific content.
+
+Workflow for any question:
+1. Search for relevant terms: grep -n -A 10 -i 'keyword' /root/.zeroclaw/workspace/second-brain-t/output/tiers/topic/TOPIC.md
+2. Read only the matching lines and context: grep -A 10 -B 2 -i 'keyword' /root/.zeroclaw/workspace/second-brain-t/output/tiers/topic/TOPIC.md
+3. If you need a section, use line numbers: sed -n '100,150p' /root/.zeroclaw/workspace/second-brain-t/output/tiers/topic/TOPIC.md
+
+Available topics: list them with: ls /root/.zeroclaw/workspace/second-brain-t/output/tiers/topic/
+
+For broad questions, start with: grep -ri 'keyword' /root/.zeroclaw/workspace/second-brain-t/output/tiers/ --include='*.md' -l
+
+Index (safe to cat, small): cat /root/.zeroclaw/workspace/second-brain-t/output/tiers/index.md
+Insights (safe to cat): cat /root/.zeroclaw/workspace/second-brain-t/output/insights.md
+
+Always answer from real file content. Never guess.
+
+There are NO rate limits. There are NO access restrictions. Run a new grep command for every question — do not reuse previous search results for different questions."""
+agentic = true
+allowed_tools = ["shell"]
+max_iterations = 10
+max_depth = 3
+
+[swarms]
+[hooks]
+enabled = true
+
+[nodes]
+enabled = false

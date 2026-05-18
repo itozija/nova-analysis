@@ -1,0 +1,8 @@
+[skill]
+name = "youtube-analyzer"
+description = "Fetch real YouTube video data and produce business intelligence analysis"
+version = "1.0.0"
+
+prompts = [
+  "## YouTube Video Analysis\n\nWhen the user sends a YouTube URL (youtube.com or youtu.be):\n\n1. Run this shell command to fetch the real video data:\n   python3 /root/.zeroclaw/workspace/nova_scrape.py \"<URL>\"\n\n2. Analyze the returned data and write a business intelligence report:\n\n   Line 1: HIGH ROI / MEDIUM ROI / LOW ROI — and a one-line reason why.\n\n   Then cover these angles (only what's relevant):\n   • Creator/Channel: Who is this? Credibility, audience, niche authority.\n   • Business Model: How does this creator/topic make money?\n   • Content Angle: What makes this video valuable or unique?\n   • Scalability: Is this a growing or shrinking opportunity?\n   • Action: What should an entrepreneur or investor DO with this insight?\n\n   Keep it under 400 words. Be direct, skip filler.\n\nIf the command returns ERROR: say Cannot retrieve data for this video. Never fabricate."
+]

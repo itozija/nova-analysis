@@ -1,13 +1,12 @@
 #!/bin/bash
 # Nova Analysis — One-command VPS setup
-# Run this on your VPS after installing ZeroClaw:
-#   bash setup.sh
+# Prerequisites: ZeroClaw installed, Node.js installed
+# Run on your VPS: bash setup.sh
 
 set -euo pipefail
 
 WORKSPACE="/root/.zeroclaw/workspace"
-SBT_DIR="$WORKSPACE/second-brain-t"
-KB_DIR="$WORKSPACE/knowledge"
+CONFIG_FILE="/root/.zeroclaw/config.toml"
 
 echo ""
 echo "================================"
@@ -15,32 +14,78 @@ echo "  Nova Analysis Setup"
 echo "================================"
 echo ""
 
-# 1. Copy Second Brain T
-echo "[ 1/4 ] Setting up Second Brain T..."
-mkdir -p "$SBT_DIR"
-cp -r second-brain-t/* "$SBT_DIR/"
+# --- Check ZeroClaw is installed ---
+if ! command -v zeroclaw &>/dev/null; then
+    echo "ERROR: ZeroClaw is not installed."
+    echo "  Install it first: https://zeroclaw.dev/docs/install"
+    exit 1
+fi
+
+# --- Collect API keys ---
+echo "You'll need:"
+echo "  1. OpenRouter API key  → https://openrouter.ai/keys"
+echo "  2. Telegram bot token  → @BotFather on Telegram"
+echo "  3. Telegram user ID    → @userinfobot on Telegram"
+echo "  4. Apify API token     → https://console.apify.com/settings/integrations"
+echo ""
+
+read -p "Bot name (e.g. Atlas, Nova, Max): " BOT_NAME
+read -p "OpenRouter API key: " OPENROUTER_KEY
+read -p "Telegram bot token: " TELEGRAM_TOKEN
+read -p "Telegram user ID:   " TELEGRAM_USER_ID
+read -p "Apify API token:    " APIFY_TOKEN
+
+echo ""
+
+# --- 1. Copy workspace files ---
+echo "[ 1/5 ] Setting up workspace files..."
+mkdir -p "$WORKSPACE"
+cp agents/AGENTS.md "$WORKSPACE/"
+sed "s|YOUR_BOT_NAME|$BOT_NAME|g" agents/SOUL.md > "$WORKSPACE/SOUL.md"
+cp agents/USER.md "$WORKSPACE/"
+cp agents/MEMORY.md "$WORKSPACE/"
 echo "  Done"
 
-# 2. Install Python dependencies
+# --- 2. Copy skills ---
 echo ""
-echo "[ 2/4 ] Installing Python dependencies..."
+echo "[ 2/5 ] Installing skills..."
+mkdir -p "$WORKSPACE/skills/nova"
+mkdir -p "$WORKSPACE/skills/workspace"
+cp agents/skills/nova/SKILL.toml "$WORKSPACE/skills/nova/"
+sed "s|YOUR_BOT_NAME|$BOT_NAME|g" agents/skills/workspace/SKILL.toml > "$WORKSPACE/skills/workspace/SKILL.toml"
+echo "  Done"
+
+# --- 3. Copy nova_scrape.py and inject Apify token ---
+echo ""
+echo "[ 3/5 ] Setting up Nova scraper..."
+mkdir -p "$WORKSPACE"
+sed "s|YOUR_APIFY_TOKEN|$APIFY_TOKEN|" scripts/nova_scrape.py > "$WORKSPACE/nova_scrape.py"
+chmod +x "$WORKSPACE/nova_scrape.py"
+echo "  Done"
+
+# --- 4. Copy second-brain-t ---
+echo ""
+echo "[ 4/5 ] Setting up Second Brain..."
+mkdir -p "$WORKSPACE/second-brain-t"
+cp -r second-brain-t/* "$WORKSPACE/second-brain-t/"
+mkdir -p "$WORKSPACE/knowledge"
 pip3 install pdfplumber python-docx python-pptx --quiet --break-system-packages 2>/dev/null \
-    || pip3 install pdfplumber python-docx python-pptx --quiet
+    || pip3 install pdfplumber python-docx python-pptx --quiet 2>/dev/null || true
 echo "  Done"
 
-# 3. Create knowledge folder
+# --- 5. Generate config ---
 echo ""
-echo "[ 3/4 ] Creating knowledge folder..."
-mkdir -p "$KB_DIR"
-echo "  $KB_DIR"
-
-# 4. Patch ZeroClaw config
-echo ""
-echo "[ 4/4 ] Configuring ZeroClaw agent..."
-python3 zeroclaw_patch.py
+echo "[ 5/5 ] Writing ZeroClaw config..."
+mkdir -p "$(dirname $CONFIG_FILE)"
+sed \
+    -e "s|YOUR_OPENROUTER_API_KEY|$OPENROUTER_KEY|" \
+    -e "s|YOUR_TELEGRAM_BOT_TOKEN|$TELEGRAM_TOKEN|" \
+    -e "s|YOUR_TELEGRAM_USER_ID|$TELEGRAM_USER_ID|" \
+    -e "s|YOUR_APIFY_TOKEN|$APIFY_TOKEN|g" \
+    config/config.template.toml > "$CONFIG_FILE"
 echo "  Done"
 
-# Create sbt command
+# --- Create sbt helper ---
 cat > /usr/local/bin/sbt << 'SCRIPT'
 #!/bin/bash
 SBT="/root/.zeroclaw/workspace/second-brain-t"
@@ -61,15 +106,16 @@ echo "================================"
 echo ""
 echo "Next steps:"
 echo ""
-echo "  1. Upload your files from your Mac:"
-echo "     Run update-kb.sh on your Mac"
+echo "  1. Start the agent:"
+echo "     systemctl --user start zeroclaw"
 echo ""
-echo "  2. Build your knowledge base:"
+echo "  2. Upload your knowledge files from your Mac:"
+echo "     bash update-kb.sh"
+echo ""
+echo "  3. Build the knowledge base:"
 echo "     sbt build"
 echo ""
-echo "  3. Restart ZeroClaw:"
-echo "     zeroclaw service restart"
-echo ""
 echo "  4. Message your Telegram bot:"
-echo "     what's in my knowledge base?"
+echo "     @Nova https://youtube.com/watch?v=..."
+echo "     @SecondBrain what does the knowledge base say about X?"
 echo ""
